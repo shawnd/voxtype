@@ -120,6 +120,17 @@ pub(crate) fn apply_cli_overrides(config: &mut config::Config, cli: &Cli) -> Opt
     if let Some(threads) = cli.threads {
         config.whisper.threads = Some(threads);
     }
+    if cli.parakeet_streaming_pause_secs.is_some()
+        || cli.parakeet_streaming_silence_threshold.is_some()
+    {
+        let parakeet = config.parakeet.get_or_insert_with(Default::default);
+        if let Some(seconds) = cli.parakeet_streaming_pause_secs {
+            parakeet.streaming_pause_secs = seconds;
+        }
+        if let Some(threshold) = cli.parakeet_streaming_silence_threshold {
+            parakeet.streaming_silence_threshold = threshold;
+        }
+    }
     if cli.gpu_isolation {
         config.whisper.gpu_isolation = true;
     }

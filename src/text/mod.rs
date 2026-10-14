@@ -147,13 +147,24 @@ impl TextProcessor {
 
     /// Process text by applying all enabled transformations
     pub fn process(&self, text: &str) -> String {
+        self.process_inner(text, false)
+    }
+
+    /// Process an append-only streaming delta. Boundary whitespace belongs to
+    /// neighboring deltas, so filler cleanup must not trim it as if this were
+    /// a complete utterance. Spaces left by removed fillers also separate words.
+    pub fn process_streaming_delta(&self, text: &str) -> String {
+        self.process_inner(text, true)
+    }
+
+    fn process_inner(&self, text: &str, preserve_boundary_whitespace: bool) -> String {
         let mut result = text.to_string();
 
         // Filter filler words first, on the raw transcription. Running before
         // word_replacements lets users override the default list (e.g. by
         // mapping "um" to itself) without needing to disable the filter.
         if self.filter_filler_words {
-            result = self.apply_filler_filter(&result);
+            result = self.apply_filler_filter(&result, preserve_boundary_whitespace);
         }
 
         // Apply replacements first so phrases containing spoken punctuation words
@@ -276,10 +287,15 @@ impl TextProcessor {
     ///   "uh hello"           -> "hello"
     ///   "I think, uh."       -> "I think."
     ///   "um uh hello"        -> "hello"
-    fn apply_filler_filter(&self, text: &str) -> String {
+    fn apply_filler_filter(&self, text: &str, preserve_boundary_whitespace: bool) -> String {
         let Some(re) = &self.filler_re else {
             return text.to_string();
         };
+        if preserve_boundary_whitespace && !re.is_match(text) {
+            // An ordinary delta may itself be whitespace or punctuation;
+            // utterance cleanup would erase meaningful append-only output.
+            return text.to_string();
+        }
 
         // Replace each filler with a single space so the input
         // "um, hello" becomes " , hello" and we can fold whitespace below.
@@ -305,6 +321,28 @@ impl TextProcessor {
 
         // Collapse multiple spaces left behind to a single space.
         result = self.filler_space_re.replace_all(&result, " ").into_owned();
+
+        if preserve_boundary_whitespace {
+            let leading_len = result.len() - result.trim_start().len();
+            let trailing_start = result.trim_end().len().max(leading_len);
+            // Remove dangling connectors inside the whitespace boundaries.
+            // Keep spaces after a removed leading connector too: "um, world"
+            // becomes " world", which can safely follow an already typed word.
+            let body = result[leading_len..trailing_start]
+                .trim_start_matches([',', ';', ':'])
+                .trim_end_matches([',', ';', ':']);
+            if body.is_empty() && leading_len == 0 && trailing_start == result.len() {
+                // Removing a filler plus its dangling connector must still
+                // separate the words on either side of this delta.
+                return " ".to_string();
+            }
+            return format!(
+                "{}{}{}",
+                &result[..leading_len],
+                body,
+                &result[trailing_start..]
+            );
+        }
 
         // Trim leading/trailing whitespace and dangling connector punctuation
         // produced when fillers appeared at the start/end of the utterance.
@@ -382,6 +420,33 @@ fn clean_punctuation_spacing(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn streaming_filler_cleanup_preserves_delta_boundaries() {
+        let config = TextConfig {
+            filter_filler_words: true,
+            ..Default::default()
+        };
+        let tp = TextProcessor::new(&config);
+        for (raw, delta, batch) in [
+            (" world", " world", "world"),
+            ("hello ", "hello ", "hello"),
+            (" ,", " ,", ""),
+            ("hello  world", "hello  world", "hello world"),
+            (" um world", " world", "world"),
+            ("um, world", " world", "world"),
+            ("hello, uh", "hello ", "hello"),
+            (" um ", " ", ""),
+            (" um,", " ", ""),
+            ("uh;", " ", ""),
+            ("hello um world", "hello world", "hello world"),
+            ("\n世界\t", "\n世界\t", "世界"),
+            ("", "", ""),
+        ] {
+            assert_eq!(tp.process_streaming_delta(raw), delta, "delta: {raw:?}");
+            assert_eq!(tp.process(raw), batch, "batch: {raw:?}");
+        }
+    }
 
     /// #566: "um" is the masculine indefinite article in Portuguese, so the
     /// English filler list silently turned "Faça um commit" into

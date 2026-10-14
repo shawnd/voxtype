@@ -186,13 +186,13 @@ impl StreamingSession {
         let processed;
         let text = match text_processor {
             Some(tp) => {
-                processed = tp.process(text);
+                processed = tp.process_streaming_delta(text);
                 processed.as_str()
             }
             None => text,
         };
         if text.is_empty() {
-            self.clear_partial();
+            self.finalize_pending_partial();
             return Ok(());
         }
 
@@ -247,7 +247,7 @@ impl StreamingSession {
     /// is a file.
     pub fn commit_segment_silent(&mut self, text: &str) {
         if text.is_empty() {
-            self.clear_partial();
+            self.finalize_pending_partial();
             return;
         }
         let finalized_tail = format!("{}{}", self.partial, text);
@@ -304,7 +304,7 @@ impl StreamingSession {
         let processed;
         let text = match text_processor {
             Some(tp) => {
-                processed = tp.process(text);
+                processed = tp.process_streaming_delta(text);
                 processed.as_str()
             }
             None => text,
@@ -388,9 +388,22 @@ impl Default for StreamingSession {
     }
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    // Opt-in interception keeps daemon cancellation tests off the desktop.
+    pub(crate) static TEST_BACKSPACES: std::sync::Arc<std::sync::Mutex<Vec<usize>>>;
+}
+
 /// Backspace `count` chars using the first available method.
 /// Returns the actual number of backspaces emitted.
 async fn emit_backspaces(count: usize) -> usize {
+    #[cfg(test)]
+    if TEST_BACKSPACES
+        .try_with(|log| log.lock().unwrap().push(count))
+        .is_ok()
+    {
+        return count;
+    }
     if count == 0 {
         return 0;
     }
@@ -469,6 +482,152 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use std::sync::Mutex;
+
+    #[tokio::test]
+    async fn filtered_final_delta_keeps_separator_after_typed_partial() {
+        let tp = TextProcessor::new(&crate::config::TextConfig {
+            filter_filler_words: true,
+            ..Default::default()
+        });
+        for tail in [" world", " um world", "um, world"] {
+            let out = std::sync::Arc::new(RecordingOutput::new());
+            let chain = chain_with(out.clone());
+            let mut session = StreamingSession::new();
+            session
+                .type_partial_delta(&chain, "hello".into(), None, None)
+                .await
+                .unwrap();
+            session
+                .commit_segment(&chain, tail, Some(&tp), None, None)
+                .await
+                .unwrap();
+            assert_eq!(out.typed(), ["hello", " world"], "tail: {tail:?}");
+            assert_eq!(session.finalized_text(), "hello world");
+            assert_eq!(session.typed_chars(), 11);
+            assert!(session.partial().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn filtered_final_only_pause_segments_keep_word_boundaries() {
+        let tp = TextProcessor::new(&crate::config::TextConfig {
+            filter_filler_words: true,
+            ..Default::default()
+        });
+        let out = std::sync::Arc::new(RecordingOutput::new());
+        let chain = chain_with(out.clone());
+        let mut session = StreamingSession::new();
+        // Each Final is an append-only delta from a pause-separated segment.
+        for tail in ["hello", " world", " um again"] {
+            session
+                .commit_segment(&chain, tail, Some(&tp), None, None)
+                .await
+                .unwrap();
+        }
+        assert_eq!(out.typed(), ["hello", " world", " again"]);
+        assert_eq!(session.finalized_text(), "hello world again");
+        assert_eq!(session.typed_chars(), 17);
+    }
+
+    #[tokio::test]
+    async fn filler_only_final_retains_separator_for_the_next_delta() {
+        let tp = TextProcessor::new(&crate::config::TextConfig {
+            filter_filler_words: true,
+            ..Default::default()
+        });
+        for tail in [" um ", " um,", "uh;"] {
+            let out = std::sync::Arc::new(RecordingOutput::new());
+            let chain = chain_with(out.clone());
+            let mut session = StreamingSession::new();
+            session
+                .type_partial_delta(&chain, "hello".into(), None, None)
+                .await
+                .unwrap();
+            session
+                .commit_segment(&chain, tail, Some(&tp), None, None)
+                .await
+                .unwrap();
+            session
+                .type_partial_delta(&chain, "world".into(), None, None)
+                .await
+                .unwrap();
+            session
+                .commit_segment(&chain, "", Some(&tp), None, None)
+                .await
+                .unwrap();
+            assert_eq!(out.typed(), ["hello", " ", "world"], "tail: {tail:?}");
+            assert_eq!(session.finalized_text(), "hello world");
+            assert_eq!(session.typed_chars(), 11);
+        }
+    }
+
+    #[tokio::test]
+    async fn filtered_replacement_tail_keeps_separator_and_rewind_accounting() {
+        let tp = TextProcessor::new(&crate::config::TextConfig {
+            filter_filler_words: true,
+            ..Default::default()
+        });
+        let backspaces = std::sync::Arc::new(Mutex::new(Vec::new()));
+        TEST_BACKSPACES
+            .scope(backspaces.clone(), async {
+                let out = std::sync::Arc::new(RecordingOutput::new());
+                let chain = chain_with(out.clone());
+                let mut session = StreamingSession::new();
+                session
+                    .type_partial_delta(&chain, "hello wrong".into(), None, None)
+                    .await
+                    .unwrap();
+                session
+                    .replace_and_commit(&chain, 6, " um, world", Some(&tp), None, None)
+                    .await
+                    .unwrap();
+                assert_eq!(out.typed(), ["hello wrong", " world"]);
+                assert_eq!(session.finalized_text(), "hello world");
+                assert_eq!(session.typed_chars(), 11);
+                session.rewind().await.unwrap();
+                assert_eq!(session.typed_chars(), 0);
+            })
+            .await;
+        assert_eq!(*backspaces.lock().unwrap(), [6, 11]);
+    }
+
+    #[tokio::test]
+    async fn empty_pause_final_commits_typed_partial_without_retyping() {
+        let out = std::sync::Arc::new(RecordingOutput::new());
+        let chain = chain_with(out.clone());
+        let mut session = StreamingSession::new();
+        session
+            .type_partial_delta(&chain, "héllo".into(), None, None)
+            .await
+            .unwrap();
+        session
+            .commit_segment(&chain, "", None, None, None)
+            .await
+            .unwrap();
+        session
+            .type_partial_delta(&chain, " world".into(), None, None)
+            .await
+            .unwrap();
+        session
+            .commit_segment(&chain, "!", None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(out.typed(), ["héllo", " world", "!"]);
+        assert_eq!(session.finalized_text(), "héllo world!");
+        assert_eq!(session.typed_chars(), 12);
+        assert!(session.partial().is_empty());
+    }
+
+    #[test]
+    fn empty_pause_final_preserves_file_output_partial() {
+        let mut session = StreamingSession::new();
+        session.observe_partial_delta("hello");
+        session.commit_segment_silent("");
+        session.observe_partial_delta(" world");
+        session.commit_segment_silent("!");
+        assert_eq!(session.finalized_text(), "hello world!");
+        assert!(session.partial().is_empty());
+    }
 
     /// In-memory output that records every typed string. Used to
     /// verify session bookkeeping without spawning subprocesses.

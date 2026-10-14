@@ -35,8 +35,8 @@ pub struct ParakeetConfig {
 
     /// Use the cache-aware streaming pipeline (parakeet-rs `ParakeetUnified`)
     /// instead of the batch CTC/TDT models. When true, voxtype emits live
-    /// partial transcripts during recording and types the final transcript
-    /// on hotkey release. Requires a streaming-capable model directory
+    /// text deltas during recording and flushes the tail on pauses or stop.
+    /// Requires a streaming-capable model directory
     /// (TDT v3 family with `tokenizer.model`).
     /// Default: false (batch pipeline, identical to pre-streaming behavior).
     #[serde(default)]
@@ -56,18 +56,36 @@ pub struct ParakeetConfig {
     /// `UnifiedStreamingConfig::right_context_secs`.
     #[serde(default = "default_streaming_right_context_secs")]
     pub streaming_right_context_secs: f32,
+
+    /// Finalize and reset streaming decoder context after this much quiet
+    /// audio following speech. Zero disables pause segmentation.
+    #[serde(default = "default_streaming_pause_secs")]
+    pub streaming_pause_secs: f32,
+
+    /// RMS amplitude below which a 20ms frame counts as quiet (16kHz PCM).
+    /// Lower this for quiet microphones; raise it for background noise.
+    #[serde(default = "default_streaming_silence_threshold")]
+    pub streaming_silence_threshold: f32,
+}
+
+fn default_streaming_pause_secs() -> f32 {
+    1.0
+}
+
+fn default_streaming_silence_threshold() -> f32 {
+    0.002
 }
 
 fn default_streaming_chunk_secs() -> f32 {
-    0.5
+    0.32
 }
 
 fn default_streaming_left_context_secs() -> f32 {
-    1.5
+    5.6
 }
 
 fn default_streaming_right_context_secs() -> f32 {
-    0.5
+    0.32
 }
 
 impl Default for ParakeetConfig {
@@ -80,6 +98,8 @@ impl Default for ParakeetConfig {
             streaming_chunk_secs: default_streaming_chunk_secs(),
             streaming_left_context_secs: default_streaming_left_context_secs(),
             streaming_right_context_secs: default_streaming_right_context_secs(),
+            streaming_pause_secs: default_streaming_pause_secs(),
+            streaming_silence_threshold: default_streaming_silence_threshold(),
         }
     }
 }
@@ -187,6 +207,26 @@ mod tests {
         assert_eq!(config.model, "parakeet-tdt-0.6b-v3");
         assert!(config.model_type.is_none());
         assert!(!config.on_demand_loading);
+    }
+
+    #[cfg(feature = "parakeet")]
+    #[test]
+    fn streaming_defaults_validate_with_parakeet_api() {
+        // Both construction paths must work when users only enable streaming.
+        let parsed: ParakeetConfig =
+            toml::from_str("model = \"parakeet-unified-en-0.6b\"\nstreaming = true").unwrap();
+        for config in [ParakeetConfig::default(), parsed] {
+            let validated = parakeet_rs::UnifiedStreamingConfig {
+                chunk_secs: config.streaming_chunk_secs,
+                left_context_secs: config.streaming_left_context_secs,
+                right_context_secs: config.streaming_right_context_secs,
+            }
+            .validate()
+            .expect("streaming defaults must satisfy the decoder's mel-frame alignment");
+            assert_eq!(validated.chunk_secs, 0.32);
+            assert_eq!(validated.left_context_secs, 5.6);
+            assert_eq!(validated.right_context_secs, 0.32);
+        }
     }
 
     #[test]

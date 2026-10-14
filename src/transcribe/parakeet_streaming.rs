@@ -18,19 +18,11 @@
 //!
 //! # Partial / Final policy
 //!
-//! `parakeet-rs` does not surface end-of-utterance signals from the unified
-//! pipeline (that lives in the multitalker / EOU model). Until we add VAD-
-//! based segmentation, this implementation:
-//!
-//! - emits one [`StreamingEvent::Partial`] per audio chunk with the
-//!   *cumulative* transcript so far;
-//! - emits exactly one [`StreamingEvent::Final`] with the flushed text on
-//!   stream close (samples sender dropped or cancel signal);
-//! - emits exactly one [`StreamingEvent::Ended`] last.
-//!
-//! This gives us live OSD partials throughout the recording, with the final
-//! commit happening at hotkey release. Mid-recording incremental typing
-//! (commit-on-pause) is a follow-up once VAD-segmentation lands.
+//! Partial and Final text are **deltas**, never cumulative transcripts.
+//! After speech followed by a configurable pause, flush the remaining tail,
+//! emit Final, reset all decoder caches, and advance the segment ID. Capture
+//! stays armed until EOF or cancellation. Energy is measured in 20ms frames,
+//! using audio duration rather than inference speed or wall-clock time.
 
 use super::parakeet::{build_execution_config, resolve_model_path};
 use super::streaming::{StreamHandle, StreamingEvent, StreamingTranscriber};
@@ -40,6 +32,199 @@ use crate::error::TranscribeError;
 use parakeet_rs::{ParakeetUnified, ParakeetUnifiedHandle, UnifiedStreamingConfig};
 use std::sync::Mutex;
 use tokio::sync::{mpsc, oneshot};
+
+fn validate_endpoint_config(config: &ParakeetConfig) -> Result<(), TranscribeError> {
+    if !config.streaming_pause_secs.is_finite() || config.streaming_pause_secs < 0.0 {
+        return Err(TranscribeError::InitFailed(
+            "[parakeet] streaming_pause_secs must be finite and >= 0 (0 disables pauses)".into(),
+        ));
+    }
+    if !config.streaming_silence_threshold.is_finite()
+        || !(0.0..=1.0).contains(&config.streaming_silence_threshold)
+        || config.streaming_silence_threshold == 0.0
+    {
+        return Err(TranscribeError::InitFailed(
+            "[parakeet] streaming_silence_threshold must be finite and in (0, 1]".into(),
+        ));
+    }
+    Ok(())
+}
+
+// Keep endpoint/event policy testable without loading model weights.
+trait SegmentDecoder {
+    fn chunk(&mut self, audio: &[f32]) -> Result<String, TranscribeError>;
+    fn flush_tail(&mut self) -> Result<String, TranscribeError>;
+    fn reset_context(&mut self);
+}
+
+impl SegmentDecoder for ParakeetUnified {
+    fn chunk(&mut self, audio: &[f32]) -> Result<String, TranscribeError> {
+        self.transcribe_chunk(audio).map_err(|e| {
+            TranscribeError::InferenceFailed(format!("Parakeet transcribe_chunk failed: {e}"))
+        })
+    }
+
+    fn flush_tail(&mut self) -> Result<String, TranscribeError> {
+        self.flush()
+            .map_err(|e| TranscribeError::InferenceFailed(format!("Parakeet flush failed: {e}")))
+    }
+
+    fn reset_context(&mut self) {
+        self.reset();
+    }
+}
+
+struct SegmentStream<D> {
+    decoder: D,
+    frame: Vec<f32>,
+    pause_samples: usize,
+    threshold: f32,
+    quiet_samples: usize,
+    speech_seen: bool,
+    segment_id: u64,
+    segment_has_text: bool,
+    output_ends_with_space: bool,
+    output_seen: bool,
+}
+
+impl<D: SegmentDecoder> SegmentStream<D> {
+    fn new(decoder: D, pause_secs: f32, threshold: f32) -> Self {
+        Self {
+            decoder,
+            frame: Vec::with_capacity(320),
+            pause_samples: (pause_secs as f64 * 16000.0).ceil() as usize,
+            threshold,
+            quiet_samples: 0,
+            speech_seen: false,
+            segment_id: 0,
+            segment_has_text: false,
+            output_ends_with_space: false,
+            output_seen: false,
+        }
+    }
+
+    fn prepare_delta(&mut self, mut text: String) -> String {
+        if text.is_empty() {
+            return text;
+        }
+        // A reset tokenizer may omit the leading space it would have emitted
+        // with prior context. Insert it only when the next segment has text,
+        // so a trailing pause never types an extra character.
+        if !self.segment_has_text
+            && self.output_seen
+            && !self.output_ends_with_space
+            && !text.starts_with(char::is_whitespace)
+            && !text.starts_with(['.', ',', '!', '?', ':', ';', ')', ']'])
+        {
+            text.insert(0, ' ');
+        }
+        self.segment_has_text = true;
+        self.output_seen = true;
+        self.output_ends_with_space = text.ends_with(char::is_whitespace);
+        text
+    }
+
+    fn push(
+        &mut self,
+        mut audio: &[f32],
+        emit: &mut impl FnMut(StreamingEvent),
+    ) -> Result<(), TranscribeError> {
+        while !audio.is_empty() {
+            let count = (320 - self.frame.len()).min(audio.len());
+            self.frame.extend_from_slice(&audio[..count]);
+            audio = &audio[count..];
+            if self.frame.len() == 320 {
+                self.process_frame(emit)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn process_frame(
+        &mut self,
+        emit: &mut impl FnMut(StreamingEvent),
+    ) -> Result<(), TranscribeError> {
+        let energy = self.frame.iter().map(|s| s * s).sum::<f32>() / self.frame.len() as f32;
+        if energy >= self.threshold * self.threshold {
+            self.speech_seen = true;
+            self.quiet_samples = 0;
+        } else if self.speech_seen {
+            self.quiet_samples = self.quiet_samples.saturating_add(self.frame.len());
+        }
+        let delta = self.decoder.chunk(&self.frame)?;
+        self.frame.clear();
+        let text = self.prepare_delta(delta);
+        if !text.is_empty() {
+            emit(StreamingEvent::Partial {
+                text,
+                segment_id: self.segment_id,
+            });
+        }
+        if self.pause_samples > 0 && self.speech_seen && self.quiet_samples >= self.pause_samples {
+            self.finalize(emit)?;
+            self.decoder.reset_context();
+            self.segment_id += 1;
+            self.segment_has_text = false;
+            self.speech_seen = false;
+            self.quiet_samples = 0;
+        }
+        Ok(())
+    }
+
+    fn finalize(&mut self, emit: &mut impl FnMut(StreamingEvent)) -> Result<(), TranscribeError> {
+        let tail = self.decoder.flush_tail()?;
+        let text = self.prepare_delta(tail);
+        // Even an empty tail is a boundary: partials still need committing.
+        emit(StreamingEvent::Final {
+            text,
+            segment_id: self.segment_id,
+        });
+        Ok(())
+    }
+
+    fn finish(&mut self, emit: &mut impl FnMut(StreamingEvent)) -> Result<(), TranscribeError> {
+        if !self.frame.is_empty() {
+            self.process_frame(emit)?;
+        }
+        self.finalize(emit)
+    }
+}
+
+fn drive_stream<D: SegmentDecoder>(
+    mut segment: SegmentStream<D>,
+    mut samples_rx: mpsc::Receiver<Vec<f32>>,
+    events_tx: mpsc::Sender<StreamingEvent>,
+    mut cancel_rx: oneshot::Receiver<()>,
+) {
+    let runtime = tokio::runtime::Handle::current();
+    let mut cancelled = false;
+    let mut emit = |event| {
+        let _ = runtime.block_on(events_tx.send(event));
+    };
+    loop {
+        // Cancellation must wake a receiver even if no audio arrives.
+        let chunk = runtime.block_on(async {
+            tokio::select! {
+                biased;
+                _ = &mut cancel_rx => { cancelled = true; None }
+                chunk = samples_rx.recv() => chunk,
+            }
+        });
+        let Some(chunk) = chunk else { break };
+        if let Err(err) = segment.push(&chunk, &mut emit) {
+            emit(StreamingEvent::Error(err));
+            emit(StreamingEvent::Ended);
+            return;
+        }
+    }
+    // On cancel discard untyped audio; the daemon rewinds typed deltas.
+    if !cancelled {
+        if let Err(err) = segment.finish(&mut emit) {
+            emit(StreamingEvent::Error(err));
+        }
+    }
+    emit(StreamingEvent::Ended);
+}
 
 /// Streaming-capable Parakeet transcriber backed by `ParakeetUnified`.
 pub struct ParakeetStreamingTranscriber {
@@ -52,10 +237,13 @@ pub struct ParakeetStreamingTranscriber {
     /// Reusable batch instance for `Transcriber::transcribe`. Reset between
     /// calls so no inter-call state leaks.
     batch: Mutex<ParakeetUnified>,
+    pause_secs: f32,
+    silence_threshold: f32,
 }
 
 impl ParakeetStreamingTranscriber {
     pub fn new(config: &ParakeetConfig) -> Result<Self, TranscribeError> {
+        validate_endpoint_config(config)?;
         // Streaming-capability gate. The cache-aware streaming pipeline
         // needs both `tokenizer.model` at load time and a decoder graph
         // sized for the streaming inference loop. Models in the registry
@@ -146,6 +334,8 @@ impl ParakeetStreamingTranscriber {
             handle,
             streaming_config,
             batch: Mutex::new(batch),
+            pause_secs: config.streaming_pause_secs,
+            silence_threshold: config.streaming_silence_threshold,
         })
     }
 }
@@ -194,10 +384,10 @@ impl Transcriber for ParakeetStreamingTranscriber {
 impl StreamingTranscriber for ParakeetStreamingTranscriber {
     fn start_stream(
         &self,
-        mut samples_rx: mpsc::Receiver<Vec<f32>>,
+        samples_rx: mpsc::Receiver<Vec<f32>>,
     ) -> Result<StreamHandle, TranscribeError> {
         // Spawn a fresh ParakeetUnified instance for this session.
-        let mut unified =
+        let unified =
             ParakeetUnified::from_shared_with_streaming_config(&self.handle, self.streaming_config)
                 .map_err(|e| {
                     TranscribeError::InitFailed(format!(
@@ -207,72 +397,11 @@ impl StreamingTranscriber for ParakeetStreamingTranscriber {
                 })?;
 
         let (events_tx, events_rx) = mpsc::channel::<StreamingEvent>(64);
-        let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
+        let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
+        let segment = SegmentStream::new(unified, self.pause_secs, self.silence_threshold);
 
         let task = tokio::task::spawn_blocking(move || -> Result<(), TranscribeError> {
-            let mut last_text = String::new();
-            let segment_id: u64 = 0;
-            let runtime = tokio::runtime::Handle::current();
-
-            loop {
-                // Check cancel without blocking.
-                match cancel_rx.try_recv() {
-                    Ok(()) => {
-                        tracing::debug!("Parakeet streaming session cancelled");
-                        break;
-                    }
-                    Err(oneshot::error::TryRecvError::Closed) => {
-                        // Sender dropped without sending; treat as cancel.
-                        break;
-                    }
-                    Err(oneshot::error::TryRecvError::Empty) => {}
-                }
-
-                let chunk = match runtime.block_on(samples_rx.recv()) {
-                    Some(c) => c,
-                    None => break, // graceful EOF
-                };
-
-                if chunk.is_empty() {
-                    continue;
-                }
-
-                let text = match unified.transcribe_chunk(&chunk) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        let err = TranscribeError::InferenceFailed(format!(
-                            "ParakeetUnified::transcribe_chunk failed: {}",
-                            e
-                        ));
-                        let _ = runtime.block_on(events_tx.send(StreamingEvent::Error(err)));
-                        let _ = runtime.block_on(events_tx.send(StreamingEvent::Ended));
-                        return Ok(());
-                    }
-                };
-
-                if text != last_text {
-                    last_text = text.clone();
-                    let _ = runtime
-                        .block_on(events_tx.send(StreamingEvent::Partial { text, segment_id }));
-                }
-            }
-
-            // Drain any buffered audio with flush() on close.
-            let final_text = match unified.flush() {
-                Ok(t) => t.trim().to_string(),
-                Err(e) => {
-                    tracing::warn!("ParakeetUnified::flush failed: {}", e);
-                    last_text.trim().to_string()
-                }
-            };
-
-            if !final_text.is_empty() {
-                let _ = runtime.block_on(events_tx.send(StreamingEvent::Final {
-                    text: final_text,
-                    segment_id,
-                }));
-            }
-            let _ = runtime.block_on(events_tx.send(StreamingEvent::Ended));
+            drive_stream(segment, samples_rx, events_tx, cancel_rx);
             Ok(())
         });
 
@@ -299,6 +428,257 @@ impl StreamingTranscriber for ParakeetStreamingTranscriber {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Uses the user's already-downloaded model; never captures a microphone
+    /// or sends text to the desktop. Run explicitly with --ignored.
+    #[test]
+    #[ignore = "requires downloaded parakeet-unified-en-0.6b and ONNX runtime"]
+    fn real_model_pause_resume_smoke() {
+        let config = ParakeetConfig {
+            model: "parakeet-unified-en-0.6b".into(),
+            streaming: true,
+            ..Default::default()
+        };
+        let transcriber = ParakeetStreamingTranscriber::new(&config).unwrap();
+        let decoder = ParakeetUnified::from_shared_with_streaming_config(
+            &transcriber.handle,
+            transcriber.streaming_config,
+        )
+        .unwrap();
+        let mut stream = SegmentStream::new(decoder, 1.0, 0.002);
+        let mut wav = hound::WavReader::open("tests/fixtures/vad/speech_hello.wav").unwrap();
+        assert_eq!(wav.spec().sample_rate, 16000);
+        assert_eq!(wav.spec().channels, 1);
+        let audio: Vec<f32> = wav
+            .samples::<i16>()
+            .map(|s| s.unwrap() as f32 / 32768.0)
+            .collect();
+        let mut events = Vec::new();
+        for _ in 0..2 {
+            for chunk in audio.chunks(997) {
+                stream.push(chunk, &mut |e| events.push(e)).unwrap();
+            }
+            stream
+                .push(&vec![0.0; 24000], &mut |e| events.push(e))
+                .unwrap();
+        }
+        stream.finish(&mut |e| events.push(e)).unwrap();
+        let transcript = text(&events);
+        eprintln!("Pause/resume transcript: {transcript:?}");
+        assert!(stream.segment_id >= 2);
+        for id in [0, 1] {
+            assert!(events.iter().any(|e| matches!(e,
+                StreamingEvent::Partial { text, segment_id } | StreamingEvent::Final { text, segment_id }
+                    if *segment_id == id && !text.trim().is_empty()
+            )));
+        }
+        assert!(!transcript.trim().is_empty());
+    }
+
+    #[derive(Default)]
+    struct FakeDecoder {
+        resets: usize,
+        samples: usize,
+        tail: String,
+        fail_flush: bool,
+    }
+
+    impl SegmentDecoder for FakeDecoder {
+        fn chunk(&mut self, audio: &[f32]) -> Result<String, TranscribeError> {
+            self.samples += audio.len();
+            Ok(if audio.iter().any(|s| *s > 0.002) {
+                "go"
+            } else {
+                ""
+            }
+            .into())
+        }
+        fn flush_tail(&mut self) -> Result<String, TranscribeError> {
+            if self.fail_flush {
+                return Err(TranscribeError::InferenceFailed(
+                    "test flush failure".into(),
+                ));
+            }
+            Ok(self.tail.clone())
+        }
+        fn reset_context(&mut self) {
+            self.resets += 1;
+        }
+    }
+
+    fn stream() -> SegmentStream<FakeDecoder> {
+        SegmentStream::new(FakeDecoder::default(), 1.0, 0.002)
+    }
+
+    #[tokio::test]
+    async fn cancellation_wakes_idle_audio_receiver_and_does_not_flush_tail() {
+        for drop_sender in [false, true] {
+            let (audio_tx, audio_rx) = mpsc::channel(4);
+            let (events_tx, mut events_rx) = mpsc::channel(64);
+            let (cancel_tx, cancel_rx) = oneshot::channel();
+            let mut segment = stream();
+            segment.decoder.tail = "must not type".into();
+            let task = tokio::task::spawn_blocking(move || {
+                drive_stream(segment, audio_rx, events_tx, cancel_rx)
+            });
+            audio_tx.send(vec![0.003; 320]).await.unwrap();
+            assert!(matches!(
+                events_rx.recv().await,
+                Some(StreamingEvent::Partial { .. })
+            ));
+            if drop_sender {
+                drop(cancel_tx);
+            } else {
+                cancel_tx.send(()).unwrap();
+            }
+            let event = tokio::time::timeout(std::time::Duration::from_secs(2), events_rx.recv())
+                .await
+                .unwrap();
+            assert!(matches!(event, Some(StreamingEvent::Ended)));
+            task.await.unwrap();
+            assert!(events_rx.recv().await.is_none());
+            drop(audio_tx);
+        }
+    }
+
+    #[tokio::test]
+    async fn graceful_eof_flushes_tail_then_ends() {
+        let (audio_tx, audio_rx) = mpsc::channel(4);
+        let (events_tx, mut events_rx) = mpsc::channel(64);
+        let (_cancel_tx, cancel_rx) = oneshot::channel();
+        let mut segment = stream();
+        segment.decoder.tail = "!".into();
+        audio_tx.send(vec![0.003; 320]).await.unwrap();
+        drop(audio_tx);
+        tokio::task::spawn_blocking(move || drive_stream(segment, audio_rx, events_tx, cancel_rx))
+            .await
+            .unwrap();
+        assert!(
+            matches!(events_rx.recv().await, Some(StreamingEvent::Partial { text, .. }) if text == "go")
+        );
+        assert!(
+            matches!(events_rx.recv().await, Some(StreamingEvent::Final { text, .. }) if text == "!")
+        );
+        assert!(matches!(
+            events_rx.recv().await,
+            Some(StreamingEvent::Ended)
+        ));
+        assert!(events_rx.recv().await.is_none());
+    }
+
+    fn text(events: &[StreamingEvent]) -> String {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                StreamingEvent::Partial { text, .. } | StreamingEvent::Final { text, .. } => {
+                    Some(text.as_str())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pause_resets_once_then_resumes_with_new_id_and_spacing() {
+        let mut stream = stream();
+        stream.decoder.tail = "!".into();
+        let mut events = Vec::new();
+        let mut emit = |e| events.push(e);
+        stream.push(&vec![0.0; 32000], &mut emit).unwrap();
+        assert_eq!(stream.decoder.resets, 0);
+        stream.push(&[0.003; 320], &mut emit).unwrap();
+        stream.push(&vec![0.0; 15680], &mut emit).unwrap();
+        assert_eq!(stream.decoder.resets, 0);
+        stream.push(&[0.0; 320], &mut emit).unwrap();
+        assert_eq!(stream.decoder.resets, 1);
+        stream.push(&vec![0.0; 48000], &mut emit).unwrap();
+        assert_eq!(stream.decoder.resets, 1);
+        stream.push(&[0.003; 320], &mut emit).unwrap();
+        stream.push(&vec![0.0; 16000], &mut emit).unwrap();
+        assert_eq!(stream.decoder.resets, 2);
+        assert_eq!(text(&events), "go! go!");
+        let finals: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamingEvent::Final { segment_id, .. } => Some(*segment_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(finals, [0, 1]);
+    }
+
+    #[test]
+    fn quiet_endings_restart_pause_timer_and_identical_deltas_are_preserved() {
+        let mut stream = stream();
+        let mut events = Vec::new();
+        let mut emit = |e| events.push(e);
+        stream.push(&[0.003; 320], &mut emit).unwrap();
+        stream.push(&vec![0.0; 12800], &mut emit).unwrap();
+        stream.push(&[0.0021; 320], &mut emit).unwrap();
+        stream.push(&vec![0.0; 12800], &mut emit).unwrap();
+        assert_eq!(stream.decoder.resets, 0);
+        stream.push(&[0.0; 3200], &mut emit).unwrap();
+        assert_eq!(stream.decoder.resets, 1);
+        assert_eq!(text(&events), "gogo");
+    }
+
+    #[test]
+    fn transport_chunk_boundaries_do_not_change_endpoints_or_drop_audio() {
+        let mut audio = vec![0.003; 320];
+        audio.extend(vec![0.0; 16000]);
+        audio.extend(vec![0.003; 113]);
+        let mut a = stream();
+        let mut b = stream();
+        let mut ea = Vec::new();
+        let mut eb = Vec::new();
+        a.push(&audio, &mut |e| ea.push(e)).unwrap();
+        for part in audio.chunks(137) {
+            b.push(part, &mut |e| eb.push(e)).unwrap();
+        }
+        a.finish(&mut |e| ea.push(e)).unwrap();
+        b.finish(&mut |e| eb.push(e)).unwrap();
+        assert_eq!(a.decoder.samples, audio.len());
+        assert_eq!(b.decoder.samples, audio.len());
+        assert_eq!(text(&ea), "go go");
+        assert_eq!(text(&ea), text(&eb));
+        assert_eq!(a.decoder.resets, b.decoder.resets);
+    }
+
+    #[test]
+    fn zero_pause_disables_reset_and_flush_error_does_not_replay_partials() {
+        let mut stream = SegmentStream::new(FakeDecoder::default(), 0.0, 0.002);
+        let mut events = Vec::new();
+        stream.push(&[0.003; 640], &mut |e| events.push(e)).unwrap();
+        stream
+            .push(&vec![0.0; 32000], &mut |e| events.push(e))
+            .unwrap();
+        assert_eq!(stream.decoder.resets, 0);
+        stream.decoder.fail_flush = true;
+        assert!(stream.finish(&mut |e| events.push(e)).is_err());
+        assert_eq!(text(&events), "gogo");
+    }
+
+    #[test]
+    fn endpoint_config_defaults_and_validation() {
+        let config: ParakeetConfig = toml::from_str("model = 'custom'").unwrap();
+        assert_eq!(config.streaming_pause_secs, 1.0);
+        assert_eq!(config.streaming_silence_threshold, 0.002);
+        assert!(validate_endpoint_config(&config).is_ok());
+        for pause in [-1.0, f32::NAN, f32::INFINITY] {
+            let invalid = ParakeetConfig {
+                streaming_pause_secs: pause,
+                ..config.clone()
+            };
+            assert!(validate_endpoint_config(&invalid).is_err());
+        }
+        for threshold in [0.0, -0.1, 1.1, f32::NAN, f32::INFINITY] {
+            let invalid = ParakeetConfig {
+                streaming_silence_threshold: threshold,
+                ..config.clone()
+            };
+            assert!(validate_endpoint_config(&invalid).is_err());
+        }
+    }
 
     /// Smoke test that the type and trait signatures compile. Real model-
     /// driven tests require ONNX runtime + a downloaded model and live in

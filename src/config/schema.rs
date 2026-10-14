@@ -437,6 +437,26 @@ pub const CONFIG_KEYS: &[KeySpec] = &[
         "Load the model when recording starts and unload at idle, trading first-keystroke latency for memory.",
     )
     .for_onnx_engine("parakeet"),
+    spec(
+        "parakeet.streaming_pause_secs",
+        "parakeet",
+        "streaming_pause_secs",
+        KeyType::Float { min: 0.0, max: f32::MAX as f64 },
+        "Engine",
+        "Streaming pause",
+        "Seconds of quiet after speech before flushing and resetting decoder context; 0 disables resets.",
+    )
+    .for_onnx_engine("parakeet"),
+    spec(
+        "parakeet.streaming_silence_threshold",
+        "parakeet",
+        "streaming_silence_threshold",
+        KeyType::Float { min: f32::MIN_POSITIVE as f64, max: 1.0 },
+        "Engine",
+        "Streaming silence RMS",
+        "Quiet-frame RMS threshold; lower for quiet speech, raise for background noise (default 0.002).",
+    )
+    .for_onnx_engine("parakeet"),
     // moonshine
     spec(
         "moonshine.model",
@@ -1703,6 +1723,8 @@ pub fn resolve(key: &str, cfg: &Config) -> Option<Json> {
             None => Json::Null,
         },
         "parakeet.on_demand_loading" => json!(pk().on_demand_loading),
+        "parakeet.streaming_pause_secs" => json!(pk().streaming_pause_secs),
+        "parakeet.streaming_silence_threshold" => json!(pk().streaming_silence_threshold),
         "parakeet.streaming" => json!(pk().streaming),
 
         "moonshine.model" => json!(mn().model),

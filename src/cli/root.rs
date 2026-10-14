@@ -92,6 +92,24 @@ pub struct Cli {
     #[arg(long, value_name = "N", help_heading = "Transcription")]
     pub threads: Option<usize>,
 
+    /// Reset Parakeet streaming context after this many seconds of quiet (0 disables)
+    #[arg(
+        long,
+        env = "VOXTYPE_PARAKEET_STREAMING_PAUSE_SECS",
+        value_name = "SECONDS",
+        help_heading = "Transcription"
+    )]
+    pub parakeet_streaming_pause_secs: Option<f32>,
+
+    /// Parakeet streaming quiet-frame RMS threshold (default 0.002; lower for quiet speech)
+    #[arg(
+        long,
+        env = "VOXTYPE_PARAKEET_STREAMING_SILENCE_THRESHOLD",
+        value_name = "RMS",
+        help_heading = "Transcription"
+    )]
+    pub parakeet_streaming_silence_threshold: Option<f32>,
+
     /// Run transcription in a subprocess to release GPU memory after each recording
     #[arg(long, help_heading = "Transcription", hide_short_help = true)]
     pub gpu_isolation: bool,

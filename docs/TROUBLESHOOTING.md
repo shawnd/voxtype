@@ -306,6 +306,23 @@ max_duration_secs = 120  # 2 minutes
 
 ## Transcription Issues
 
+### Parakeet streaming window configuration is rejected
+
+Use `[parakeet] streaming_chunk_secs = 0.32`,
+`streaming_left_context_secs = 5.6`, and `streaming_right_context_secs = 0.32`
+(the defaults). The decoder requires mel-frame counts divisible by eight;
+older examples using `0.5`, `1.5`, and `0.5` do not satisfy that requirement.
+Remove those overrides or use the validated defaults.
+
+### Parakeet streaming pauses reset too early or never reset
+
+Pause endpoints use `[parakeet] streaming_pause_secs` (default `1.0`) and
+`streaming_silence_threshold` (default `0.002` RMS). Increase the pause duration
+or lower the threshold if quiet speech is split. Raise the threshold if
+background noise prevents endpoints. Set the duration to `0` to disable resets.
+Recording remains active after a pause: use your toggle shortcut or
+`voxtype record stop` to end the session.
+
 ### "Model not found"
 
 **Cause:** Whisper model not downloaded or wrong path.

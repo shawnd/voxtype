@@ -1370,12 +1370,56 @@ a warning to the log.
 engine = "parakeet"
 
 [parakeet]
-model = "parakeet-tdt-0.6b-v3"
+model = "parakeet-unified-en-0.6b"
 streaming = true
+streaming_chunk_secs = 0.32
+streaming_left_context_secs = 5.6
+streaming_right_context_secs = 0.32
 
 [hotkey]
 mode = "toggle"
 ```
+
+### Streaming pause endpoints
+
+The streaming window defaults are `streaming_chunk_secs = 0.32`,
+`streaming_left_context_secs = 5.6`, and `streaming_right_context_secs = 0.32`.
+Custom durations must convert to mel-frame counts divisible by eight
+(multiples of 0.08 seconds). Stopping with `voxtype record stop` closes the
+microphone and drains the backend's final words before ending the session.
+
+With `[parakeet] streaming = true`, one second of quiet after speech flushes
+remaining text and resets decoder context. Recording stays armed in the same
+toggle session: resume speaking without pressing the shortcut again. Live text
+is still incremental; finalization emits only the untyped tail.
+
+```toml
+[parakeet]
+model = "parakeet-unified-en-0.6b"
+streaming = true
+streaming_chunk_secs = 0.32
+streaming_left_context_secs = 5.6
+streaming_right_context_secs = 0.32
+streaming_pause_secs = 1.0          # 0 disables pause resets
+streaming_silence_threshold = 0.002 # RMS amplitude; lower for quiet speech
+```
+
+Pause duration uses 16kHz audio samples in 20ms frames, not inference time.
+Continued silence does not repeatedly reset the decoder. Resumed segments get
+a separating space when needed. Quiet audio is fed to the decoder before
+flushing to preserve trailing words and right context. Cancel retains the
+existing typed-text rewind behavior.
+
+`streaming_pause_secs` must be finite and nonnegative (default `1.0`).
+`streaming_silence_threshold` must be finite, greater than zero and at most one
+(default `0.002`). This is an energy detector: background noise above the
+threshold prevents endpoints. Lower the threshold for soft speech; raise it
+if pauses are missed. Set pause duration to `0` for stream-close-only resets.
+
+CLI: `--parakeet-streaming-pause-secs`,
+`--parakeet-streaming-silence-threshold`. Environment:
+`VOXTYPE_PARAKEET_STREAMING_PAUSE_SECS`,
+`VOXTYPE_PARAKEET_STREAMING_SILENCE_THRESHOLD`.
 
 ### Complete Example
 

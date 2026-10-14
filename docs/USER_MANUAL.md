@@ -926,6 +926,12 @@ model = "parakeet-tdt-0.6b-v3"  # or "parakeet-tdt-0.6b-v3-int8"
 # streaming = true              # type text as you speak; requires toggle activation
 ```
 
+**Pause reset:** Parakeet streaming resets decoder context after one second
+of quiet following speech. The microphone remains armed in the same toggle
+session. Adjust `[parakeet] streaming_pause_secs`, or set it to `0` to disable
+pause resets. Lower `streaming_silence_threshold` (default `0.002` RMS) for quiet
+microphones. See [Streaming pause endpoints](CONFIGURATION.md#streaming-pause-endpoints).
+
 **Streaming dictation (experimental):** set `[parakeet] streaming = true` and
 voxtype types text incrementally while you speak. Streaming requires
 `[hotkey] mode = "toggle"` (or a compositor binding that calls
@@ -934,6 +940,20 @@ disrupt libinput's tracking of held physical keys on Wayland compositors,
 so a held PTT key never fires its release event. The daemon auto-promotes
 push-to-talk to toggle at startup when streaming is enabled and logs a
 warning.
+
+Use a streaming-compatible model and the validated window defaults:
+
+```toml
+[parakeet]
+model = "parakeet-unified-en-0.6b"
+streaming = true
+streaming_chunk_secs = 0.32
+streaming_left_context_secs = 5.6
+streaming_right_context_secs = 0.32
+```
+
+`voxtype record stop` drains the final words before returning to idle.
+Cancel discards pending words and rewinds text already typed.
 
 See [PARAKEET.md](PARAKEET.md) for detailed setup instructions.
 
